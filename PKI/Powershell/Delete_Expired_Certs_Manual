@@ -1,0 +1,63 @@
+# Query CA database using certutil and parse output
+$expiredCerts = certutil -view -restrict "NotAfter<now" -out "RequestID,RequesterName,CommonName,NotAfter,CertificateTemplate,SerialNumber" csv
+
+# Parse the CSV output
+$parsedCerts = $expiredCerts | ConvertFrom-Csv
+
+# Display the expired certificates
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "ABGELAUFENE ZERTIFIKATE GEFUNDEN" -ForegroundColor Yellow
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Gesamtanzahl: $($parsedCerts.Count)" -ForegroundColor Yellow
+Write-Host ""
+
+$parsedCerts | Format-Table -AutoSize
+
+# Confirmation prompt
+Write-Host "`n========================================" -ForegroundColor Red
+Write-Host "WARNUNG: ZERTIFIKATE LÖSCHEN" -ForegroundColor Red
+Write-Host "========================================" -ForegroundColor Red
+Write-Host "Sie sind dabei, $($parsedCerts.Count) abgelaufene Zertifikate zu löschen." -ForegroundColor Yellow
+Write-Host "Diese Aktion kann NICHT rückgängig gemacht werden!`n" -ForegroundColor Red
+
+# Ask for confirmation
+$confirmation = Read-Host "Möchten Sie fortfahren? (Ja/Nein)"
+
+if ($confirmation -eq "Ja" -or $confirmation -eq "ja" -or $confirmation -eq "J" -or $confirmation -eq "j" -or $confirmation -eq "Yes" -or $confirmation -eq "yes" -or $confirmation -eq "Y" -or $confirmation -eq "y") {
+    Write-Host "`nLösche Zertifikate..." -ForegroundColor Yellow
+    
+    $successCount = 0
+    $failCount = 0
+    
+    foreach ($cert in $parsedCerts) {
+        try {
+            # Delete certificate from CA database
+            certutil -deleterow $cert.'Issued Request ID'
+            
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "Zertifikat Request ID: $($cert.'Issued Request ID') erfolgreich gelöscht" -ForegroundColor Green
+                $successCount++
+            } else {
+                Write-Host "Fehler beim Löschen von Zertifikat Request ID: $($cert.'Issued Request ID')" -ForegroundColor Red
+                $failCount++
+            }
+        }
+        catch {
+            Write-Host "Ausnahme beim Löschen von Zertifikat Request ID: $($cert.'Issued Request ID'): $($_.Exception.Message)" -ForegroundColor Red
+            $failCount++
+        }
+    }
+    
+    # Summary
+    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "ZUSAMMENFASSUNG" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "Erfolgreich gelöscht: $successCount" -ForegroundColor Green
+    Write-Host "Fehlgeschlagen: $failCount" -ForegroundColor Red
+    Write-Host "Gesamt: $($parsedCerts.Count)" -ForegroundColor Yellow
+    
+} else {
+    Write-Host "`nVorgang abgebrochen. Keine Zertifikate wurden gelöscht." -ForegroundColor Yellow
+}
+
+Write-Host "`nSkript beendet." -ForegroundColor Cyan
