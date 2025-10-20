@@ -1,63 +1,291 @@
-# Query CA database using certutil and parse output
-$expiredCerts = certutil -view -restrict "NotAfter<now" -out "RequestID,RequesterName,CommonName,NotAfter,CertificateTemplate,SerialNumber" csv
+<#
+.SYNOPSIS
+    Automatically deletes expired certificates from CA database and exports results to CSV files.
 
-# Parse the CSV output
-$parsedCerts = $expiredCerts | ConvertFrom-Csv
+.DESCRIPTION
+    This script queries the Certificate Authority database for certificates that have been
+    expired for at least 180 days, deletes them, and creates detailed CSV logs of the 
+    operations. It maintains a cleanup policy to retain only the 8 most recent log files.
 
-# Display the expired certificates
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "ABGELAUFENE ZERTIFIKATE GEFUNDEN" -ForegroundColor Yellow
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Gesamtanzahl: $($parsedCerts.Count)" -ForegroundColor Yellow
+.NOTES
+    Version: 2.0
+    Author: PKI Administrator
+    Date: October 2025
+    Requirements: Must run with CA admin privileges
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputDirectory = "C:\temp\PKICleanup",
+    [int]$RetentionCount = 8,
+    [switch]$WhatIf
+)
+
+# Script configuration
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
+
+# Initialize script variables
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$scriptStartTime = Get-Date
+$logDirectory = Join-Path $OutputDirectory "Logs"
+
+# Create log directory if it doesn't exist
+try {
+    if (!(Test-Path $logDirectory)) {
+        New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+    }
+}
+catch {
+    Write-Error "Failed to create log directory: $($_.Exception.Message)"
+    exit 1
+}
+
+# Start transcript logging
+$transcriptPath = Join-Path $logDirectory "PKI_Cleanup_Transcript_$timestamp.log"
+try {
+    Start-Transcript -Path $transcriptPath -Append -ErrorAction Stop
+}
+catch {
+    Write-Warning "Failed to start transcript: $($_.Exception.Message)"
+    $transcriptPath = $null
+}
+
+Write-Host "=== PKI Certificate Cleanup Script Started ===" 
+Write-Host "Start Time: $scriptStartTime"
+Write-Host "Output Directory: $OutputDirectory"
+Write-Host "Log Directory: $logDirectory"
+Write-Host "Retention Count: $RetentionCount"
+if ($WhatIf) { Write-Host "Mode: WHATIF (No actual deletions will occur)" }
 Write-Host ""
 
-$parsedCerts | Format-Table -AutoSize
+# Create output directory if it doesn't exist
+try {
+    if (!(Test-Path $OutputDirectory)) {
+        New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+        Write-Host "Created output directory: $OutputDirectory"
+    }
+}
+catch {
+    Write-Error "Failed to create output directory: $($_.Exception.Message)"
+    exit 1
+}
 
-# Confirmation prompt
-Write-Host "`n========================================" -ForegroundColor Red
-Write-Host "WARNUNG: ZERTIFIKATE LÖSCHEN" -ForegroundColor Red
-Write-Host "========================================" -ForegroundColor Red
-Write-Host "Sie sind dabei, $($parsedCerts.Count) abgelaufene Zertifikate zu löschen." -ForegroundColor Yellow
-Write-Host "Diese Aktion kann NICHT rückgängig gemacht werden!`n" -ForegroundColor Red
+# Initialize collections using ArrayList for better performance
+$deletedCerts = [System.Collections.ArrayList]::new()
+$failedCerts = [System.Collections.ArrayList]::new()
 
-# Ask for confirmation
-$confirmation = Read-Host "Möchten Sie fortfahren? (Ja/Nein)"
-
-if ($confirmation -eq "Ja" -or $confirmation -eq "ja" -or $confirmation -eq "J" -or $confirmation -eq "j" -or $confirmation -eq "Yes" -or $confirmation -eq "yes" -or $confirmation -eq "Y" -or $confirmation -eq "y") {
-    Write-Host "`nLösche Zertifikate..." -ForegroundColor Yellow
+# Query CA database for certificates expired for at least 180 days
+Write-Host "Querying CA database for certificates expired for at least 180 days..."
+try {
+    $expiredCerts = certutil -view -restrict "NotAfter<now-180:00:00:00" -out "RequestID,RequesterName,CommonName,NotAfter,CertificateTemplate,SerialNumber" csv
     
-    $successCount = 0
-    $failCount = 0
+    if ($LASTEXITCODE -ne 0) {
+        throw "certutil query failed with exit code: $LASTEXITCODE"
+    }
     
-    foreach ($cert in $parsedCerts) {
-        try {
+    # Parse CSV output and filter out empty/header lines
+    $parsedCerts = $expiredCerts | ConvertFrom-Csv | Where-Object { $_.'Issued Request ID' -and $_.'Issued Request ID' -ne 'RequestID' }
+    
+    if (-not $parsedCerts) {
+        Write-Host "No certificates found that have been expired for at least 180 days."
+        exit 0
+    }
+    
+    Write-Host "Found $($parsedCerts.Count) certificates expired for 180+ days to process."
+}
+catch {
+    Write-Error "Failed to query CA database: $($_.Exception.Message)"
+    exit 1
+}
+# Helper function to create certificate record object
+function New-CertificateRecord {
+    param(
+        [object]$Certificate,
+        [string]$Status,
+        [string]$ErrorMessage = $null
+    )
+    
+    return [PSCustomObject]@{
+        RequestID = $Certificate.'Issued Request ID'
+        RequesterName = $Certificate.'Requester Name'
+        CommonName = $Certificate.'Common Name'
+        NotAfter = $Certificate.'Certificate Expiration Date'
+        CertificateTemplate = $Certificate.'Certificate Template'
+        SerialNumber = $Certificate.'Serial Number'
+        DeletionDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Status = $Status
+        ErrorMessage = $ErrorMessage
+    }
+}
+
+# Process certificate deletions
+Write-Host "`nProcessing certificate deletions..."
+$processedCount = 0
+$successCount = 0
+$failCount = 0
+
+foreach ($cert in $parsedCerts) {
+    $processedCount++
+    $requestId = $cert.'Issued Request ID'
+    
+    Write-Progress -Activity "Processing Certificates" -Status "Processing Request ID: $requestId" -PercentComplete (($processedCount / $parsedCerts.Count) * 100)
+    
+    try {
+        if ($WhatIf) {
+            Write-Host "WHATIF: Would delete certificate Request ID: $requestId"
+            $deletedCerts.Add((New-CertificateRecord -Certificate $cert -Status "Would Delete (WhatIf)")) | Out-Null
+            $successCount++
+        }
+        else {
             # Delete certificate from CA database
-            certutil -deleterow $cert.'Issued Request ID'
+            certutil -deleterow $requestId | Out-Null
             
             if ($LASTEXITCODE -eq 0) {
-                Write-Host "Zertifikat Request ID: $($cert.'Issued Request ID') erfolgreich gelöscht" -ForegroundColor Green
+                Write-Host "Certificate Request ID: $requestId successfully deleted"
+                $deletedCerts.Add((New-CertificateRecord -Certificate $cert -Status "Successfully Deleted")) | Out-Null
                 $successCount++
-            } else {
-                Write-Host "Fehler beim Löschen von Zertifikat Request ID: $($cert.'Issued Request ID')" -ForegroundColor Red
+            }
+            else {
+                $errorMsg = "certutil returned exit code $LASTEXITCODE"
+                Write-Host "Failed to delete certificate Request ID: $requestId - $errorMsg"
+                $failedCerts.Add((New-CertificateRecord -Certificate $cert -Status "Failed to Delete" -ErrorMessage $errorMsg)) | Out-Null
                 $failCount++
             }
         }
-        catch {
-            Write-Host "Ausnahme beim Löschen von Zertifikat Request ID: $($cert.'Issued Request ID'): $($_.Exception.Message)" -ForegroundColor Red
-            $failCount++
-        }
     }
-    
-    # Summary
-    Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host "ZUSAMMENFASSUNG" -ForegroundColor Cyan
-    Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "Erfolgreich gelöscht: $successCount" -ForegroundColor Green
-    Write-Host "Fehlgeschlagen: $failCount" -ForegroundColor Red
-    Write-Host "Gesamt: $($parsedCerts.Count)" -ForegroundColor Yellow
-    
-} else {
-    Write-Host "`nVorgang abgebrochen. Keine Zertifikate wurden gelöscht." -ForegroundColor Yellow
+    catch {
+        $errorMsg = $_.Exception.Message
+        Write-Host "Exception while deleting certificate Request ID: $requestId - $errorMsg"
+        $failedCerts.Add((New-CertificateRecord -Certificate $cert -Status "Exception Occurred" -ErrorMessage $errorMsg)) | Out-Null
+        $failCount++
+    }
 }
 
-Write-Host "`nSkript beendet." -ForegroundColor Cyan
+Write-Progress -Activity "Processing Certificates" -Completed
+
+# Optimized cleanup function to retain specified number of recent files
+function Remove-OldFiles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Directory,
+        
+        [Parameter(Mandatory)]
+        [string]$FilePattern,
+        
+        [Parameter(Mandatory)]
+        [string]$FileType,
+        
+        [int]$RetainCount = 8
+    )
+    
+    Write-Host "`n--- $FileType Cleanup ---"
+    
+    try {
+        if (!(Test-Path $Directory)) {
+            Write-Host "Directory does not exist: $Directory"
+            return
+        }
+        
+        # Get all files matching the pattern, sorted by creation time (newest first)
+        $matchingFiles = Get-ChildItem -Path $Directory -Filter $FilePattern -File -ErrorAction Stop | 
+                        Sort-Object CreationTime -Descending
+        
+        Write-Host "Found $($matchingFiles.Count) $FileType files in directory"
+        
+        if ($matchingFiles.Count -gt $RetainCount) {
+            # Get files to delete (everything beyond the retention count)
+            $filesToDelete = $matchingFiles | Select-Object -Skip $RetainCount
+            
+            Write-Host "Removing $($filesToDelete.Count) old $FileType files (keeping $RetainCount most recent)..."
+            
+            $deletedCount = 0
+            foreach ($file in $filesToDelete) {
+                try {
+                    Remove-Item -Path $file.FullName -Force -ErrorAction Stop
+                    Write-Host "  Deleted: $($file.Name)"
+                    $deletedCount++
+                }
+                catch {
+                    Write-Host "  Failed to delete: $($file.Name) - $($_.Exception.Message)"
+                }
+            }
+            
+            Write-Host "Cleanup completed: $deletedCount $FileType files deleted, $RetainCount files retained"
+        }
+        else {
+            Write-Host "No cleanup needed (found $($matchingFiles.Count) $FileType files, limit is $RetainCount)"
+        }
+    }
+    catch {
+        Write-Host "Error during $FileType cleanup: $($_.Exception.Message)"
+    }
+}
+
+# Export results to CSV files
+Write-Host "`n--- Exporting Results ---"
+
+$exportedFiles = @()
+
+try {
+    # Export successful deletions
+    if ($deletedCerts.Count -gt 0) {
+        $deletedCertsPath = Join-Path $OutputDirectory "Deleted_Certificates_$timestamp.csv"
+        $deletedCerts | Export-Csv -Path $deletedCertsPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        Write-Host "Exported $($deletedCerts.Count) deleted certificates to: $deletedCertsPath"
+        $exportedFiles += $deletedCertsPath
+    }
+
+    # Export failed deletions
+    if ($failedCerts.Count -gt 0) {
+        $failedCertsPath = Join-Path $OutputDirectory "Failed_Certificate_Deletions_$timestamp.csv"
+        $failedCerts | Export-Csv -Path $failedCertsPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        Write-Host "Exported $($failedCerts.Count) failed deletions to: $failedCertsPath"
+        $exportedFiles += $failedCertsPath
+    }
+
+    if ($exportedFiles.Count -eq 0) {
+        Write-Host "No CSV files created (no certificates were processed)"
+    }
+}
+catch {
+    Write-Error "Failed to export CSV files: $($_.Exception.Message)"
+}
+
+# Perform cleanup to retain specified number of most recent files
+Remove-OldFiles -Directory $OutputDirectory -FilePattern "*Certificates*.csv" -FileType "CSV" -RetainCount $RetentionCount
+Remove-OldFiles -Directory $logDirectory -FilePattern "PKI_Cleanup_Transcript_*.log" -FileType "Transcript Log" -RetainCount $RetentionCount
+
+# Final summary
+$scriptEndTime = Get-Date
+$executionTime = $scriptEndTime - $scriptStartTime
+
+Write-Host "`n=== PKI Certificate Cleanup Summary ==="
+Write-Host "Execution Time: $($executionTime.ToString('hh\:mm\:ss'))"
+Write-Host "Certificates Found: $($parsedCerts.Count)"
+Write-Host "Successfully Processed: $successCount"
+Write-Host "Failed: $failCount"
+Write-Host "CSV Files Created: $($exportedFiles.Count)"
+
+if ($exportedFiles.Count -gt 0) {
+    Write-Host "`nGenerated Files:"
+    foreach ($file in $exportedFiles) {
+        Write-Host "  - $(Split-Path $file -Leaf)"
+    }
+}
+
+Write-Host "`nScript completed at: $scriptEndTime"
+
+# Stop transcript logging
+if ($transcriptPath) {
+    try {
+        Stop-Transcript
+        Write-Host "Transcript saved: $transcriptPath"
+    }
+    catch {
+        Write-Warning "Failed to stop transcript: $($_.Exception.Message)"
+    }
+}
+
+Write-Host "=== End of PKI Certificate Cleanup ==="
