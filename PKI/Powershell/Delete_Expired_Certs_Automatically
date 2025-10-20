@@ -77,8 +77,9 @@ $failedCerts = [System.Collections.ArrayList]::new()
 
 # Query CA database for certificates expired for at least 180 days
 Write-Host "Querying CA database for certificates expired for at least 180 days..."
+$ExpiredSince180d = $((Get-Date).AddDays(-180).ToString($(Get-culture).DateTimeFormat.ShortDatePattern))
 try {
-    $expiredCerts = certutil -view -restrict "NotAfter<now-180:00:00:00" -out "RequestID,RequesterName,CommonName,NotAfter,CertificateTemplate,SerialNumber" csv
+    $expiredCerts = certutil -view -restrict "NotAfter<=$ExpiredSince180d" -out "RequestID,RequesterName,CommonName,NotAfter,CertificateTemplate,SerialNumber" csv
     
     if ($LASTEXITCODE -ne 0) {
         throw "certutil query failed with exit code: $LASTEXITCODE"
